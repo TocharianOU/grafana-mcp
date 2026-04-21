@@ -4,7 +4,7 @@ import type { GrafanaClient } from "../client.js";
 import { checkTokenLimit } from "../utils/token-limiter.js";
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Shared helpers
 // ---------------------------------------------------------------------------
 
 function safeStr(obj: Record<string, unknown>, key: string): string {
@@ -34,27 +34,7 @@ function safeObj(
     : null;
 }
 
-/** Find a panel by numeric ID, including panels nested inside row panels. */
-function findPanelById(
-  db: Record<string, unknown>,
-  panelId: number
-): Record<string, unknown> | null {
-  const panels = safeArr(db, "panels");
-  for (const p of panels) {
-    const panel = p as Record<string, unknown>;
-    if (safeNum(panel, "id") === panelId) return panel;
-    if (safeStr(panel, "type") === "row") {
-      for (const np of safeArr(panel, "panels")) {
-        const nested = np as Record<string, unknown>;
-        if (safeNum(nested, "id") === panelId) return nested;
-      }
-    }
-  }
-  return null;
-}
-
-/** Collect all panels including those nested in rows. */
-function collectAllPanels(db: Record<string, unknown>): Array<Record<string, unknown>> {
+function allPanels(db: Record<string, unknown>): Array<Record<string, unknown>> {
   const result: Array<Record<string, unknown>> = [];
   for (const p of safeArr(db, "panels")) {
     const panel = p as Record<string, unknown>;
@@ -68,32 +48,32 @@ function collectAllPanels(db: Record<string, unknown>): Array<Record<string, unk
   return result;
 }
 
-/** Extract template variable current values from dashboard JSON. */
-function extractTemplateVars(
-  db: Record<string, unknown>
-): Record<string, string> {
+function findPanelById(
+  db: Record<string, unknown>,
+  id: number
+): Record<string, unknown> | null {
+  return allPanels(db).find((p) => safeNum(p, "id") === id) ?? null;
+}
+
+function extractVars(db: Record<string, unknown>): Record<string, string> {
   const vars: Record<string, string> = {};
-  const templating = safeObj(db, "templating");
-  if (!templating) return vars;
-  for (const v of safeArr(templating, "list")) {
+  const tpl = safeObj(db, "templating");
+  if (!tpl) return vars;
+  for (const v of safeArr(tpl, "list")) {
     const variable = v as Record<string, unknown>;
     const name = safeStr(variable, "name");
     if (!name) continue;
-    const current = safeObj(variable, "current");
-    if (current) {
-      const val = current["value"];
-      if (typeof val === "string" && val !== "$__all") {
-        vars[name] = val;
-      } else if (Array.isArray(val) && val.length > 0) {
-        const first = val[0];
-        if (typeof first === "string" && first !== "$__all") vars[name] = first;
-      }
+    const cur = safeObj(variable, "current");
+    if (!cur) continue;
+    const val = cur["value"];
+    if (typeof val === "string" && val !== "$__all") vars[name] = val;
+    else if (Array.isArray(val) && val.length > 0 && typeof val[0] === "string" && val[0] !== "$__all") {
+      vars[name] = val[0];
     }
   }
   return vars;
 }
 
-/** Substitute Grafana template variable references in a query string. */
 function substituteVars(query: string, vars: Record<string, string>): string {
   for (const [name, value] of Object.entries(vars)) {
     query = query.replaceAll(`\${${name}}`, value);
@@ -103,74 +83,69 @@ function substituteVars(query: string, vars: Record<string, string>): string {
   return query;
 }
 
-/** Substitute Grafana temporal macros ($__range, $__interval, etc.). */
-function substituteGrafanaMacros(
-  query: string,
-  startMs: number,
-  endMs: number
-): string {
-  const durationMs = endMs - startMs;
-  const durationSec = Math.floor(durationMs / 1000);
-  const durationMin = Math.floor(durationSec / 60);
+function substituteMacros(query: string, startMs: number, endMs: number): string {
+  const durMs = endMs - startMs;
+  const durSec = Math.floor(durMs / 1000);
+  const durMin = Math.floor(durSec / 60);
+  const rangeStr = durMin >= 60
+    ? `${Math.floor(durMin / 60)}h${durMin % 60 > 0 ? `${durMin % 60}m` : ""}`
+    : durMin >= 1 ? `${durMin}m` : `${durSec}s`;
 
-  const rangeStr =
-    durationMin >= 60
-      ? `${Math.floor(durationMin / 60)}h${durationMin % 60 > 0 ? `${durationMin % 60}m` : ""}`
-      : durationMin >= 1
-      ? `${durationMin}m`
-      : `${durationSec}s`;
+  const intMs = Math.max(1000, Math.floor(durMs / 100));
+  const intSec = Math.floor(intMs / 1000);
+  const intStr = intSec >= 60 ? `${Math.floor(intSec / 60)}m` : `${intSec}s`;
 
-  const intervalMs = Math.max(1000, Math.floor(durationMs / 100));
-  const intervalSec = Math.floor(intervalMs / 1000);
-  const intervalStr =
-    intervalSec >= 60 ? `${Math.floor(intervalSec / 60)}m` : `${intervalSec}s`;
-
-  query = query.replaceAll("${__range_ms}", String(durationMs));
-  query = query.replaceAll("$__range_ms", String(durationMs));
-  query = query.replaceAll("${__range_s}", String(durationSec));
-  query = query.replaceAll("$__range_s", String(durationSec));
-  query = query.replaceAll("${__range}", rangeStr);
-  query = query.replaceAll("$__range", rangeStr);
-  query = query.replaceAll("${__rate_interval}", "1m");
-  query = query.replaceAll("$__rate_interval", "1m");
-  query = query.replaceAll("${__interval_ms}", String(intervalMs));
-  query = query.replaceAll("$__interval_ms", String(intervalMs));
-  query = query.replaceAll("${__interval}", intervalStr);
-  query = query.replaceAll("$__interval", intervalStr);
-  return query;
+  const r = (s: string) =>
+    s.replaceAll("${__range_ms}", String(durMs)).replaceAll("$__range_ms", String(durMs))
+     .replaceAll("${__range_s}", String(durSec)).replaceAll("$__range_s", String(durSec))
+     .replaceAll("${__range}", rangeStr).replaceAll("$__range", rangeStr)
+     .replaceAll("${__rate_interval}", "1m").replaceAll("$__rate_interval", "1m")
+     .replaceAll("${__interval_ms}", String(intMs)).replaceAll("$__interval_ms", String(intMs))
+     .replaceAll("${__interval}", intStr).replaceAll("$__interval", intStr);
+  return r(query);
 }
 
-/** Parse a time string into a Unix ms timestamp. */
-function parseTimeToMs(t: string): number {
+function parseTimeMs(t: string): number {
   if (/^\d+$/.test(t)) return parseInt(t, 10);
   if (t === "now") return Date.now();
-  const relMatch = t.match(/^now-(\d+)([smhdw])$/);
-  if (relMatch) {
-    const amount = parseInt(relMatch[1], 10);
-    const unit = relMatch[2];
-    const multipliers: Record<string, number> = {
-      s: 1000,
-      m: 60_000,
-      h: 3_600_000,
-      d: 86_400_000,
-      w: 604_800_000,
-    };
-    return Date.now() - amount * (multipliers[unit] ?? 60_000);
+  const m = t.match(/^now-(\d+)([smhdw])$/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const mul: Record<string, number> = { s: 1e3, m: 6e4, h: 36e5, d: 864e5, w: 6048e5 };
+    return Date.now() - n * (mul[m[2]] ?? 6e4);
   }
   return new Date(t).getTime();
 }
 
-/** Try common query expression field names from a panel target. */
-function extractQueryExpr(target: Record<string, unknown>): string {
-  for (const field of ["expr", "query", "expression", "rawSql", "rawQuery"]) {
-    const v = target[field];
+function extractExpr(target: Record<string, unknown>): string {
+  for (const f of ["expr", "query", "expression", "rawSql", "rawQuery"]) {
+    const v = target[f];
     if (typeof v === "string" && v.trim()) return v;
   }
   return "";
 }
 
+function substituteAllFields(
+  target: Record<string, unknown>,
+  vars: Record<string, string>,
+  startMs: number,
+  endMs: number
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...target };
+  for (const f of ["expr", "query", "expression", "rawSql", "rawQuery"]) {
+    if (typeof result[f] === "string" && (result[f] as string).trim()) {
+      result[f] = substituteMacros(
+        substituteVars(result[f] as string, vars),
+        startMs,
+        endMs
+      );
+    }
+  }
+  return result;
+}
+
 // ---------------------------------------------------------------------------
-// Tool registration
+// Tools
 // ---------------------------------------------------------------------------
 
 export function registerPanelQueryTools(
@@ -187,22 +162,19 @@ export function registerPanelQueryTools(
     ) => void;
   }).tool.bind(server);
 
-  // Tool: get_dashboard_panel_queries
+  // -------------------------------------------------------------------------
+  // Tool 3: get_dashboard_panel_queries
+  // -------------------------------------------------------------------------
   tool(
     "get_dashboard_panel_queries",
-    "Retrieve the raw query expressions from all panels (or a specific panel) in a Grafana dashboard. Returns panel title, datasource uid/type, refId, and the query expression. Optionally applies variable substitutions to populate a processedQuery field. Use this before run_panel_query to understand what queries are inside a dashboard.",
+    "Extract the raw query expressions from every panel in a Grafana dashboard (or a specific panel). Returns panel id, title, datasource uid/type, refId, and the query string. Optionally apply variable overrides to see the final substituted query (processedQuery). Use this after get_dashboard_summary to preview panel queries before executing them with run_panel_query.",
     {
-      uid: z.string().min(1).describe("The UID of the dashboard"),
-      panelId: z
-        .number()
-        .optional()
-        .describe("Filter to a specific panel by its numeric ID"),
+      uid: z.string().min(1).describe("Dashboard UID"),
+      panelId: z.number().optional().describe("Filter to a single panel by numeric ID"),
       variables: z
         .record(z.string())
         .optional()
-        .describe(
-          "Optional variable overrides for substitution (e.g. {\"job\": \"api-server\"})"
-        ),
+        .describe("Variable overrides for substitution (e.g. {\"job\": \"api-server\"})"),
     },
     async (args) => {
       const { uid, panelId, variables } = args as {
@@ -211,30 +183,24 @@ export function registerPanelQueryTools(
         variables?: Record<string, string>;
       };
       try {
-        const data = await client.get<{
-          dashboard: Record<string, unknown>;
-          meta: Record<string, unknown>;
-        }>(`/api/dashboards/uid/${uid}`);
-
+        const data = await client.get<{ dashboard: Record<string, unknown> }>(
+          `/api/dashboards/uid/${uid}`
+        );
         const db = data.dashboard;
-        const dashVars = extractTemplateVars(db);
+        const dashVars = extractVars(db);
         const mergedVars = { ...dashVars, ...(variables ?? {}) };
 
-        const panels =
-          panelId !== undefined
-            ? (() => {
-                const p = findPanelById(db, panelId);
-                return p ? [p] : [];
-              })()
-            : collectAllPanels(db);
+        const panels = panelId !== undefined
+          ? (() => { const p = findPanelById(db, panelId); return p ? [p] : []; })()
+          : allPanels(db);
 
-        const result = panels.flatMap((panel) => {
-          const targets = safeArr(panel, "targets");
-          return targets.map((t) => {
+        const result = panels.flatMap((panel) =>
+          safeArr(panel, "targets").map((t) => {
             const target = t as Record<string, unknown>;
-            const dsObj = safeObj(target, "datasource") ?? safeObj(panel, "datasource");
-            const rawExpr = extractQueryExpr(target);
-            const processedExpr = rawExpr ? substituteVars(rawExpr, mergedVars) : "";
+            const dsObj =
+              safeObj(target, "datasource") ?? safeObj(panel, "datasource");
+            const raw = extractExpr(target);
+            const processed = raw ? substituteVars(raw, mergedVars) : "";
             return {
               panelId: safeNum(panel, "id"),
               title: safeStr(panel, "title"),
@@ -243,144 +209,86 @@ export function registerPanelQueryTools(
               datasource: dsObj
                 ? { uid: safeStr(dsObj, "uid"), type: safeStr(dsObj, "type") }
                 : null,
-              query: rawExpr,
-              processedQuery: processedExpr !== rawExpr ? processedExpr : undefined,
+              query: raw,
+              processedQuery:
+                processed !== raw && processed ? processed : undefined,
             };
-          });
-        });
+          })
+        );
 
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
       } catch (error) {
         return {
-          content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
           isError: true,
         };
       }
     }
   );
 
-  // Tool: get_dashboard_property
-  tool(
-    "get_dashboard_property",
-    "Extract a specific part of a Grafana dashboard JSON using a simple dot-notation path (e.g. 'title', 'panels', 'panels.0.title', 'templating.list', 'time'). Use this to inspect targeted dashboard fields without fetching the full JSON, saving context window space.",
-    {
-      uid: z.string().min(1).describe("The UID of the dashboard"),
-      path: z
-        .string()
-        .min(1)
-        .describe(
-          "Dot-notation path into the dashboard object. Examples: 'title', 'panels', 'panels.0.title', 'templating.list', 'annotations.list', 'time', 'tags'"
-        ),
-    },
-    async (args) => {
-      const { uid, path } = args as { uid: string; path: string };
-      try {
-        const data = await client.get<{ dashboard: Record<string, unknown> }>(
-          `/api/dashboards/uid/${uid}`
-        );
-        let current: unknown = data.dashboard;
-        for (const segment of path.split(".")) {
-          if (current === null || current === undefined) break;
-          if (typeof current === "object" && !Array.isArray(current)) {
-            current = (current as Record<string, unknown>)[segment];
-          } else if (Array.isArray(current)) {
-            const idx = parseInt(segment, 10);
-            current = isNaN(idx) ? undefined : current[idx];
-          } else {
-            current = undefined;
-          }
-        }
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(current, null, 2) }],
-        };
-      } catch (error) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // Tool: run_panel_query
+  // -------------------------------------------------------------------------
+  // Tool 4: run_panel_query
+  // -------------------------------------------------------------------------
   tool(
     "run_panel_query",
-    "Execute the actual data query for one or more panels from a Grafana dashboard. Fetches the dashboard, extracts the query from the specified panels, substitutes Grafana template variables and temporal macros ($__range, $__interval, $__rate_interval), then routes the query to Grafana's /api/ds/query endpoint. Use get_dashboard_summary to find panel IDs and get_dashboard_panel_queries to preview queries before running them. Returns raw data frame results keyed by panel ID.",
+    "Execute the live data query for one or more Grafana dashboard panels. Automatically fetches the dashboard, extracts queries from the specified panels, substitutes template variables and Grafana temporal macros ($__range, $__interval, $__rate_interval), then posts to /api/ds/query. Supports all datasource types (Prometheus, Loki, ClickHouse, CloudWatch, etc.). Returns raw data frame results keyed by panel ID. Use get_dashboard_summary to find panel IDs.",
     {
-      dashboardUid: z
-        .string()
-        .min(1)
-        .describe("The UID of the dashboard containing the panels"),
-      panelIds: z
-        .array(z.number())
-        .min(1)
-        .describe("One or more numeric panel IDs to execute"),
+      dashboardUid: z.string().min(1).describe("Dashboard UID"),
+      panelIds: z.array(z.number()).min(1).describe("One or more numeric panel IDs"),
       queryIndex: z
         .number()
         .optional()
         .default(0)
-        .describe(
-          "Zero-based index of the query to execute within each panel's targets array (default: 0). Use get_dashboard_panel_queries to see all queries."
-        ),
+        .describe("Zero-based index of the query within each panel's targets (default: 0)"),
       start: z
         .string()
         .optional()
         .default("now-1h")
-        .describe(
-          "Start time override. Accepts relative (e.g. 'now-1h', 'now-6h'), RFC3339 (e.g. '2024-01-01T00:00:00Z'), or Unix ms."
-        ),
+        .describe("Start time: relative ('now-1h', 'now-6h'), RFC3339, or Unix ms"),
       end: z
         .string()
         .optional()
         .default("now")
-        .describe(
-          "End time override. Accepts 'now', RFC3339, or Unix ms."
-        ),
+        .describe("End time: 'now', RFC3339, or Unix ms"),
       variables: z
         .record(z.string())
         .optional()
-        .describe(
-          "Dashboard variable overrides to apply during query substitution (e.g. {\"job\": \"api-server\", \"instance\": \"host1\"})"
-        ),
+        .describe("Dashboard variable overrides (e.g. {\"job\": \"api-server\"})"),
       break_token_rule: z
         .boolean()
         .optional()
         .default(false)
-        .describe("Set to true to bypass token limits in critical situations."),
+        .describe("Bypass token limits for large results."),
     },
     async (args) => {
-      const {
-        dashboardUid,
-        panelIds,
-        queryIndex,
-        start,
-        end,
-        variables,
-        break_token_rule,
-      } = args as {
-        dashboardUid: string;
-        panelIds: number[];
-        queryIndex: number;
-        start: string;
-        end: string;
-        variables?: Record<string, string>;
-        break_token_rule: boolean;
-      };
+      const { dashboardUid, panelIds, queryIndex, start, end, variables, break_token_rule } =
+        args as {
+          dashboardUid: string;
+          panelIds: number[];
+          queryIndex: number;
+          start: string;
+          end: string;
+          variables?: Record<string, string>;
+          break_token_rule: boolean;
+        };
 
       try {
-        const data = await client.get<{
-          dashboard: Record<string, unknown>;
-          meta: Record<string, unknown>;
-        }>(`/api/dashboards/uid/${dashboardUid}`);
-
+        const data = await client.get<{ dashboard: Record<string, unknown> }>(
+          `/api/dashboards/uid/${dashboardUid}`
+        );
         const db = data.dashboard;
-        const dashVars = extractTemplateVars(db);
+        const dashVars = extractVars(db);
         const mergedVars = { ...dashVars, ...(variables ?? {}) };
 
-        const startMs = parseTimeToMs(start);
-        const endMs = parseTimeToMs(end);
+        const startMs = parseTimeMs(start);
+        const endMs = parseTimeMs(end);
 
         const results: Record<string, unknown> = {};
         const errors: Record<string, string> = {};
@@ -388,78 +296,48 @@ export function registerPanelQueryTools(
         for (const panelId of panelIds) {
           try {
             const panel = findPanelById(db, panelId);
-            if (!panel) {
-              errors[String(panelId)] = `Panel with ID ${panelId} not found`;
-              continue;
-            }
+            if (!panel) { errors[panelId] = `Panel ${panelId} not found`; continue; }
 
             const targets = safeArr(panel, "targets");
-            if (targets.length === 0) {
-              errors[String(panelId)] = `Panel ${panelId} has no query targets`;
-              continue;
-            }
+            if (!targets.length) { errors[panelId] = `Panel ${panelId} has no targets`; continue; }
 
             const idx = Math.min(queryIndex, targets.length - 1);
             const target = targets[idx] as Record<string, unknown>;
 
-            // Resolve datasource UID from target or panel
             const targetDs = safeObj(target, "datasource");
             const panelDs = safeObj(panel, "datasource");
-            const dsUid =
-              safeStr(targetDs ?? {}, "uid") ||
-              safeStr(panelDs ?? {}, "uid");
-            const dsType =
-              safeStr(targetDs ?? {}, "type") ||
-              safeStr(panelDs ?? {}, "type");
+            const dsUid = safeStr(targetDs ?? {}, "uid") || safeStr(panelDs ?? {}, "uid");
+            const dsType = safeStr(targetDs ?? {}, "type") || safeStr(panelDs ?? {}, "type");
 
             if (!dsUid || dsUid.startsWith("$")) {
-              errors[String(panelId)] = `Could not resolve datasource UID for panel ${panelId} (value: "${dsUid}"). Provide variable overrides if needed.`;
+              errors[panelId] = `Cannot resolve datasource UID for panel ${panelId} ("${dsUid}"). Use variables parameter to override.`;
               continue;
             }
 
-            // Build the query expression with variable and macro substitution
-            const rawExpr = extractQueryExpr(target);
-            const substitutedExpr = substituteGrafanaMacros(
-              substituteVars(rawExpr, mergedVars),
-              startMs,
-              endMs
-            );
-
-            // Build Grafana /api/ds/query payload
-            const queryTarget: Record<string, unknown> = {
-              ...target,
-              datasource: { uid: dsUid, type: dsType },
-              refId: safeStr(target, "refId") || "A",
-            };
-
-            // Patch the query expression fields with substituted values
-            for (const field of ["expr", "query", "expression", "rawSql", "rawQuery"]) {
-              if (typeof target[field] === "string" && (target[field] as string).trim()) {
-                queryTarget[field] = substituteGrafanaMacros(
-                  substituteVars(target[field] as string, mergedVars),
-                  startMs,
-                  endMs
-                );
-              }
-            }
-
+            const substitutedTarget = substituteAllFields(target, mergedVars, startMs, endMs);
             const payload = {
-              queries: [queryTarget],
+              queries: [
+                {
+                  ...substitutedTarget,
+                  datasource: { uid: dsUid, type: dsType },
+                  refId: safeStr(target, "refId") || "A",
+                },
+              ],
               from: String(startMs),
               to: String(endMs),
             };
 
             const queryResult = await client.post<unknown>("/api/ds/query", payload);
-            results[String(panelId)] = {
+            results[panelId] = {
               panelId,
               panelTitle: safeStr(panel, "title"),
               datasourceUid: dsUid,
               datasourceType: dsType,
-              query: substitutedExpr,
+              query: extractExpr(substitutedTarget),
               data: queryResult,
             };
           } catch (err) {
-            errors[String(panelId)] = err instanceof Error ? err.message : String(err);
+            errors[panelId] = err instanceof Error ? err.message : String(err);
           }
         }
 
@@ -483,7 +361,12 @@ export function registerPanelQueryTools(
         return content;
       } catch (error) {
         return {
-          content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
           isError: true,
         };
       }

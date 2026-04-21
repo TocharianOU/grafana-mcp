@@ -1,14 +1,122 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { GrafanaClient } from "../client.js";
-import { checkTokenLimit } from "../utils/token-limiter.js";
+import { checkTokenLimit, calculateTokens } from "../utils/token-limiter.js";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface SearchHit {
+  uid?: string;
+  id?: number;
+  title?: string;
+  type?: string;
+  url?: string;
+  folderTitle?: string;
+  folderUid?: string;
+  tags?: string[];
+}
+
+interface FolderGroup {
+  folder: string;
+  count: number;
+  dashboards: string[];
+}
+
+interface SearchSummary {
+  total: number;
+  dashboards: number;
+  folders: number;
+  folderGroups: FolderGroup[];
+  topTags: Array<{ tag: string; count: number }>;
+}
+
+// ---------------------------------------------------------------------------
+// Summary generators
+// ---------------------------------------------------------------------------
+
+function buildSearchSummary(hits: SearchHit[]): SearchSummary {
+  const dashboards = hits.filter((h) => h.type !== "dash-folder");
+  const folders = hits.filter((h) => h.type === "dash-folder");
+
+  const folderMap = new Map<string, string[]>();
+  for (const h of dashboards) {
+    const folder = h.folderTitle ?? "(General)";
+    if (!folderMap.has(folder)) folderMap.set(folder, []);
+    folderMap.get(folder)!.push(h.title ?? "");
+  }
+
+  const folderGroups: FolderGroup[] = [];
+  for (const [folder, dbs] of folderMap.entries()) {
+    folderGroups.push({ folder, count: dbs.length, dashboards: dbs.slice(0, 5) });
+  }
+  folderGroups.sort((a, b) => b.count - a.count);
+
+  const tagCount = new Map<string, number>();
+  for (const h of hits) {
+    for (const t of h.tags ?? []) {
+      tagCount.set(t, (tagCount.get(t) ?? 0) + 1);
+    }
+  }
+  const topTags = [...tagCount.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([tag, count]) => ({ tag, count }));
+
+  return {
+    total: hits.length,
+    dashboards: dashboards.length,
+    folders: folders.length,
+    folderGroups,
+    topTags,
+  };
+}
+
+function formatSearchSummaryFull(s: SearchSummary): string {
+  let text = `Search Results: ${s.total} items (${s.dashboards} dashboards, ${s.folders} folders)\n\n`;
+  text += `By Folder:\n`;
+  for (const g of s.folderGroups) {
+    text += `  ${g.folder} (${g.count}): ${g.dashboards.join(", ")}`;
+    if (g.count > 5) text += ` … +${g.count - 5} more`;
+    text += "\n";
+  }
+  if (s.topTags.length > 0) {
+    text += `\nTop Tags: ${s.topTags.map((t) => `${t.tag}(${t.count})`).join(", ")}\n`;
+  }
+  return text;
+}
+
+function formatSearchSummaryCompact(s: SearchSummary, topN: number): string {
+  let text = `Search Results: ${s.total} items (${s.dashboards} dashboards, ${s.folders} folders)\n`;
+  text += `Top ${topN} folders: `;
+  text += s.folderGroups
+    .slice(0, topN)
+    .map((g) => `${g.folder}(${g.count})`)
+    .join(", ");
+  text += "\n";
+  if (s.topTags.length > 0) {
+    text += `Tags: ${s.topTags
+      .slice(0, 5)
+      .map((t) => t.tag)
+      .join(", ")}\n`;
+  }
+  return text;
+}
+
+function formatSearchSummaryMinimal(s: SearchSummary): string {
+  return `${s.total} items found (${s.dashboards} dashboards, ${s.folders} folders across ${s.folderGroups.length} folders).\n`;
+}
+
+// ---------------------------------------------------------------------------
+// Tool registration
+// ---------------------------------------------------------------------------
 
 export function registerDashboardTools(
   server: McpServer,
   client: GrafanaClient,
   maxTokenCall: number
 ) {
-  // Rebind to avoid TS2589 deep instantiation errors
   const tool = (server as unknown as {
     tool: (
       name: string,
@@ -18,51 +126,176 @@ export function registerDashboardTools(
     ) => void;
   }).tool.bind(server);
 
-  // Tool: get_dashboard_by_uid
+  // -------------------------------------------------------------------------
+  // Tool 1: search_dashboards
+  // -------------------------------------------------------------------------
   tool(
-    "get_dashboard_by_uid",
-    "Retrieve a complete Grafana dashboard by its UID, including all panels, variables, annotations, and settings. WARNING: large dashboards consume significant context. Prefer get_dashboard_summary for an overview.",
+    "search_dashboards",
+    "Search Grafana for dashboards and folders by title, tag, or folder. This is the primary entry point for any Grafana investigation — use it first to discover relevant dashboards. For large result sets the tool automatically switches to a smart summary view to save context tokens, similar to how the Elasticsearch MCP handles large index sets. Use summary_mode to control the level of detail.",
     {
-      uid: z
+      query: z
         .string()
-        .min(1)
-        .describe("The UID of the dashboard to retrieve"),
-      break_token_rule: z
+        .optional()
+        .describe("Search query to match against dashboard/folder titles"),
+      tag: z
+        .array(z.string())
+        .optional()
+        .describe("Filter by one or more tags (all must match)"),
+      type: z
+        .enum(["dash-db", "dash-folder"])
+        .optional()
+        .describe("'dash-db' for dashboards only, 'dash-folder' for folders only"),
+      folderUids: z
+        .array(z.string())
+        .optional()
+        .describe("Restrict search to specific folder UIDs"),
+      starred: z.boolean().optional().describe("Return only starred dashboards"),
+      limit: z
+        .number()
+        .optional()
+        .default(100)
+        .describe("Maximum results (default: 100, max: 5000)"),
+      summary_mode: z
         .boolean()
         .optional()
         .default(false)
         .describe(
-          "Set to true to bypass token limits in critical situations. Use sparingly to avoid context overflow."
+          "Return a grouped summary instead of full list. Auto-enabled for >50 results."
         ),
+      summary_level: z
+        .enum(["auto", "full", "compact", "minimal"])
+        .optional()
+        .default("auto")
+        .describe(
+          "Summary detail: auto (intelligent by size), full (all folders), compact (top folders), minimal (counts only)"
+        ),
+      break_token_rule: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Bypass token limits for large result sets."),
     },
     async (args) => {
-      const { uid, break_token_rule } = args as {
-        uid: string;
+      const {
+        query,
+        tag,
+        type,
+        folderUids,
+        starred,
+        limit,
+        summary_mode,
+        summary_level,
+        break_token_rule,
+      } = args as {
+        query?: string;
+        tag?: string[];
+        type?: "dash-db" | "dash-folder";
+        folderUids?: string[];
+        starred?: boolean;
+        limit: number;
+        summary_mode: boolean;
+        summary_level: "auto" | "full" | "compact" | "minimal";
         break_token_rule: boolean;
       };
+
       try {
-        const result = await client.get<unknown>(`/api/dashboards/uid/${uid}`);
-        const content = { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-        const tokenCheck = checkTokenLimit(content, maxTokenCall, break_token_rule);
-        if (!tokenCheck.allowed) {
-          return { content: [{ type: "text" as const, text: tokenCheck.error ?? "Token limit exceeded" }], isError: true };
+        const params: Record<string, string | number | boolean | undefined> = {
+          limit: Math.min(limit, 5000),
+        };
+        if (query) params.query = query;
+        if (type) params.type = type;
+        if (starred) params.starred = true;
+        if (tag?.length) params.tag = tag.join(",");
+        if (folderUids?.length) params.folderUIDs = folderUids.join(",");
+
+        const hits = await client.get<SearchHit[]>("/api/search", params);
+
+        const AUTO_SUMMARY_THRESHOLD = 50;
+        const useSummary = summary_mode || hits.length > AUTO_SUMMARY_THRESHOLD;
+
+        if (!useSummary) {
+          const content = {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(hits, null, 2),
+              },
+            ],
+          };
+          const tokenCheck = checkTokenLimit(content, maxTokenCall, break_token_rule);
+          if (!tokenCheck.allowed) {
+            // Fall through to summary
+          } else {
+            return content;
+          }
         }
-        return content;
+
+        // Smart summary mode
+        const summary = buildSearchSummary(hits);
+        const originalTokens = calculateTokens(JSON.stringify(hits));
+
+        let resultText = "";
+        let actualLevel = summary_level;
+
+        if (actualLevel === "auto") {
+          const full = formatSearchSummaryFull(summary);
+          if (calculateTokens(full) <= maxTokenCall || break_token_rule) {
+            resultText = full;
+            actualLevel = "full";
+          } else {
+            const compact = formatSearchSummaryCompact(summary, 10);
+            if (calculateTokens(compact) <= maxTokenCall || break_token_rule) {
+              resultText = compact;
+              actualLevel = "compact";
+            } else {
+              resultText = formatSearchSummaryMinimal(summary);
+              actualLevel = "minimal";
+            }
+          }
+        } else {
+          if (actualLevel === "full") resultText = formatSearchSummaryFull(summary);
+          else if (actualLevel === "compact") resultText = formatSearchSummaryCompact(summary, 10);
+          else resultText = formatSearchSummaryMinimal(summary);
+        }
+
+        const optimizedTokens = calculateTokens(resultText);
+        const saved = originalTokens - optimizedTokens;
+
+        resultText += `\n${"─".repeat(50)}\n`;
+        resultText += `Token stats: original=${originalTokens.toLocaleString()} → summary=${optimizedTokens.toLocaleString()} (saved ${saved.toLocaleString()}, level=${actualLevel})\n`;
+        resultText += `Tip: use query/tag/folderUids to narrow results, or set summary_level='full' for all details.\n`;
+
+        if (hits.length > AUTO_SUMMARY_THRESHOLD && !summary_mode) {
+          resultText =
+            `⚠ ${hits.length} results returned — auto-switched to summary mode.\n\n` +
+            resultText;
+        }
+
+        return {
+          content: [{ type: "text" as const, text: resultText }],
+        };
       } catch (error) {
-        return { content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          isError: true,
+        };
       }
     }
   );
 
-  // Tool: get_dashboard_summary
+  // -------------------------------------------------------------------------
+  // Tool 2: get_dashboard_summary
+  // -------------------------------------------------------------------------
   tool(
     "get_dashboard_summary",
-    "Get a compact summary of a Grafana dashboard including title, panel count, panel types, variables, and time range. Use this before get_dashboard_by_uid to avoid consuming large context windows.",
+    "Get a compact, token-efficient overview of a Grafana dashboard: title, tags, panel count, panel list (id, title, type, query count), template variables, and time range. Use this before get_dashboard_panel_queries or run_panel_query to understand the dashboard structure without fetching its full JSON.",
     {
-      uid: z
-        .string()
-        .min(1)
-        .describe("The UID of the dashboard to summarize"),
+      uid: z.string().min(1).describe("The UID of the dashboard to summarize"),
     },
     async (args) => {
       const { uid } = args as { uid: string };
@@ -75,6 +308,16 @@ export function registerDashboardTools(
         const db = data.dashboard as Record<string, unknown>;
         const panels = (db.panels as Array<Record<string, unknown>>) ?? [];
 
+        const allPanels: Array<Record<string, unknown>> = [];
+        for (const p of panels) {
+          allPanels.push(p);
+          if (p.type === "row") {
+            for (const np of ((p.panels as Array<Record<string, unknown>>) ?? [])) {
+              allPanels.push(np);
+            }
+          }
+        }
+
         const summary = {
           uid,
           title: db.title ?? "",
@@ -82,113 +325,46 @@ export function registerDashboardTools(
           tags: db.tags ?? [],
           refresh: db.refresh ?? "",
           timeRange: db.time ?? {},
-          panelCount: panels.length,
-          panels: panels.map((p) => ({
+          version: db.version ?? 0,
+          panelCount: allPanels.length,
+          panels: allPanels.map((p) => ({
             id: p.id,
             title: p.title ?? "",
             type: p.type ?? "",
             queryCount: ((p.targets as unknown[]) ?? []).length,
           })),
-          variables: ((db.templating as Record<string, unknown>)?.list as Array<Record<string, unknown>> ?? []).map((v) => ({
+          variables: (
+            ((db.templating as Record<string, unknown>)?.list as Array<Record<string, unknown>>) ?? []
+          ).map((v) => ({
             name: v.name,
             type: v.type,
             label: v.label ?? "",
           })),
           folderTitle: data.meta?.folderTitle ?? "",
           folderUid: data.meta?.folderUid ?? "",
-          version: db.version ?? 0,
         };
 
-        return { content: [{ type: "text" as const, text: JSON.stringify(summary, null, 2) }] };
-      } catch (error) {
-        return { content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
-      }
-    }
-  );
+        const tokenCount = calculateTokens(JSON.stringify(summary));
+        const fullDashTokens = calculateTokens(JSON.stringify(data));
+        const saved = fullDashTokens - tokenCount;
 
-  // Tool: update_dashboard
-  tool(
-    "update_dashboard",
-    "Create or update a Grafana dashboard. Provide the full dashboard JSON object in the 'dashboard' field. Use 'folderUid' to place it in a specific folder, 'overwrite' to replace an existing dashboard, and 'message' for the version history commit message.",
-    {
-      dashboard: z
-        .record(z.unknown())
-        .describe(
-          "The full Grafana dashboard JSON object. Must include 'title'. Omit 'id' to create a new dashboard."
-        ),
-      folderUid: z
-        .string()
-        .optional()
-        .describe("UID of the folder to save the dashboard into"),
-      message: z
-        .string()
-        .optional()
-        .describe("Version history commit message"),
-      overwrite: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe("Overwrite an existing dashboard with the same UID"),
-    },
-    async (args) => {
-      const { dashboard, folderUid, message, overwrite } = args as {
-        dashboard: Record<string, unknown>;
-        folderUid?: string;
-        message?: string;
-        overwrite: boolean;
-      };
-      try {
-        const body: Record<string, unknown> = { dashboard, overwrite };
-        if (folderUid) body.folderUid = folderUid;
-        if (message) body.message = message;
+        const output =
+          JSON.stringify(summary, null, 2) +
+          `\n\n${"─".repeat(50)}\n` +
+          `Token stats: full dashboard=${fullDashTokens.toLocaleString()} → summary=${tokenCount.toLocaleString()} (saved ${saved.toLocaleString()})\n` +
+          `Next: use get_dashboard_panel_queries to inspect queries, or run_panel_query to execute data.\n`;
 
-        const result = await client.post<unknown>("/api/dashboards/db", body);
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text" as const, text: output }] };
       } catch (error) {
-        return { content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
-      }
-    }
-  );
-
-  // Tool: delete_dashboard
-  tool(
-    "delete_dashboard",
-    "Delete a Grafana dashboard by its UID. This action is irreversible.",
-    {
-      uid: z.string().min(1).describe("The UID of the dashboard to delete"),
-    },
-    async (args) => {
-      const { uid } = args as { uid: string };
-      try {
-        const result = await client.delete<unknown>(`/api/dashboards/uid/${uid}`);
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-      } catch (error) {
-        return { content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
-      }
-    }
-  );
-
-  // Tool: get_dashboard_versions
-  tool(
-    "get_dashboard_versions",
-    "List the version history of a Grafana dashboard. Returns version metadata including who made changes and the commit message.",
-    {
-      uid: z.string().min(1).describe("The UID of the dashboard"),
-      limit: z
-        .number()
-        .optional()
-        .default(20)
-        .describe("Maximum number of versions to return (default: 20)"),
-    },
-    async (args) => {
-      const { uid, limit } = args as { uid: string; limit: number };
-      try {
-        const data = await client.get<{ id: number }>(`/api/dashboards/uid/${uid}`);
-        const dashId = (data as unknown as { dashboard: { id: number } }).dashboard.id;
-        const result = await client.get<unknown>(`/api/dashboards/id/${dashId}/versions`, { limit });
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-      } catch (error) {
-        return { content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          isError: true,
+        };
       }
     }
   );

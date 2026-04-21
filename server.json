@@ -8,13 +8,13 @@
     "url": "https://github.com/TocharianOU/grafana-mcp",
     "source": "github"
   },
-  "version": "1.0.0",
+  "version": "2.0.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@tocharianou/grafana-mcp",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "transport": {
         "type": "stdio"
       },
@@ -72,7 +72,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@tocharianou/grafana-mcp",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "transport": {
         "type": "streamable-http",
         "url": "http://localhost:{MCP_HTTP_PORT}/mcp"
@@ -153,7 +153,7 @@
   "_meta": {
     "io.modelcontextprotocol.registry/publisher-provided": {
       "tool": "manual",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "features": {
         "transport_modes": ["stdio", "http"],
         "security_focused": true,
