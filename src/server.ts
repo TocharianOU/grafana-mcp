@@ -9,6 +9,10 @@ import { registerAnnotationTools } from "./tools/annotations.js";
 import { registerAlertingTools } from "./tools/alerting.js";
 import { registerPrometheusTools } from "./tools/prometheus.js";
 import { registerAdminTools } from "./tools/admin.js";
+import { registerPanelQueryTools } from "./tools/panel-queries.js";
+import { registerLokiTools } from "./tools/loki.js";
+import { registerNavigationTools } from "./tools/navigation.js";
+import { registerManagementTools } from "./tools/management.js";
 
 const ConfigSchema = z.object({
   url: z
@@ -52,17 +56,32 @@ export async function createGrafanaMcpServer(config: GrafanaConfig) {
 
   const server = new McpServer({
     name: "grafana-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
+  // Core Grafana operations
   registerDashboardTools(server, client, maxTokenCall);
+  registerPanelQueryTools(server, client, maxTokenCall);
   registerFolderTools(server, client, maxTokenCall);
   registerDatasourceTools(server, client, maxTokenCall);
   registerSearchTools(server, client, maxTokenCall);
   registerAnnotationTools(server, client, maxTokenCall);
+
+  // Alerting
   registerAlertingTools(server, client, maxTokenCall);
+
+  // Metrics and logs
   registerPrometheusTools(server, client, maxTokenCall);
+  registerLokiTools(server, client, maxTokenCall);
+
+  // Navigation and rendering
+  registerNavigationTools(server, client, validatedConfig, maxTokenCall);
+
+  // Admin, user, and org management
   registerAdminTools(server, client, maxTokenCall);
+
+  // Service accounts, permissions, plugins, provisioning, RBAC
+  registerManagementTools(server, client, maxTokenCall);
 
   return server;
 }
