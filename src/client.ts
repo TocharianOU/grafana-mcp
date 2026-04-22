@@ -1,5 +1,3 @@
-import https from "https";
-
 export interface GrafanaConfig {
   url: string;
   token?: string;
@@ -28,6 +26,13 @@ export class GrafanaClient {
     this.baseUrl = config.url.replace(/\/$/, "");
     this.rejectUnauthorized =
       process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0";
+
+    // Disable TLS verification globally when configured to do so.
+    // Node.js native fetch (undici) does not accept https.Agent as dispatcher;
+    // setting the process env variable is the reliable cross-version approach.
+    if (!this.rejectUnauthorized) {
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+    }
 
     this.headers = {
       "Content-Type": "application/json",
@@ -74,14 +79,6 @@ export class GrafanaClient {
 
     if (options.body !== undefined) {
       (fetchOptions as RequestInit).body = JSON.stringify(options.body);
-    }
-
-    // Handle self-signed certificates by using a custom agent when needed
-    if (!this.rejectUnauthorized && url.startsWith("https")) {
-      (fetchOptions as RequestInit & { dispatcher?: unknown }).dispatcher =
-        new (https.Agent as unknown as new (opts: { rejectUnauthorized: boolean }) => unknown)(
-          { rejectUnauthorized: false }
-        );
     }
 
     const response = await fetch(url, fetchOptions);
